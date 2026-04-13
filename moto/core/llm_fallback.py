@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 # fallback 확인용 JSON body를 만들 때 사용한다.
 
-from moto.core.llm_agents import call_claude_api, call_gpt_api
+from moto.core.llm_agents import call_claude_api, call_gpt_api, call_gpt_api_two_step
 # 실제 LLM API 호출 구현은 llm_agents 패키지에서 가져온다.
 
 

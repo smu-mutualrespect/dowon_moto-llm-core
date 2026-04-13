@@ -7,11 +7,34 @@ import json
 import os
 # API 키와 기본 모델명을 환경변수에서 읽기 위해 사용한다.
 
+import pathlib
+# .env 파일 경로를 찾기 위해 사용한다.
+
+
+def _load_dotenv() -> None:
+    # ~/.env 파일을 읽어 환경변수에 없는 키만 os.environ에 추가한다.
+    env_path = pathlib.Path.home() / ".env"
+    if not env_path.exists():
+        return
+    with env_path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip()
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+_load_dotenv()
+
 from typing import Any, Optional
 # 함수 시그니처에 사용하는 타입 힌트를 가져온다.
 
-from urllib.request import Request, urlopen
-# 표준 라이브러리만으로 HTTP POST 요청을 보내기 위해 사용한다.
+import requests as _requests
+# urllib 대신 requests를 사용해 WSGI 환경의 소켓 타임아웃 영향을 피한다.
 
 
 def call_gpt_api(
@@ -78,6 +101,66 @@ def call_gpt_api(
 
     return "\n".join(parts).strip()
     # 여러 텍스트 조각을 하나의 문자열로 합쳐 최종 응답으로 돌려준다.
+
+
+# service+action 조합별 스키마를 메모리에 캐싱한다.
+_schema_cache: dict[str, str] = {}
+
+
+def _get_cached_schema(
+    service: str,
+    action: str,
+    prompt: str,
+    *,
+    model: Optional[str] = None,
+    timeout: float = 20.0,
+) -> str:
+    # 캐시에 있으면 GPT 호출 없이 바로 반환하고, 없으면 GPT에 물어보고 저장한다.
+    cache_key = f"{service}.{action}"
+    if cache_key not in _schema_cache:
+        _schema_cache[cache_key] = call_gpt_api(prompt, model=model, timeout=timeout)
+    return _schema_cache[cache_key]
+
+
+def call_gpt_api_two_step(
+    service: str,
+    action: str,
+    request_body: str,
+    *,
+    model: Optional[str] = None,
+    timeout: float = 20.0,
+) -> str:
+    # 2단계로 GPT를 호출한다.
+    # 1단계: 해당 action의 실제 AWS 응답 스키마를 얻는다.
+    # 2단계: 스키마 기반으로 실제 요청에 맞는 응답을 생성한다.
+
+    schema_prompt = f"""What fields does the real AWS {service} {action} API response contain?
+Return ONLY the fields that are documented in the official AWS API reference for this action.
+Do NOT add any fields that you are not 100% certain are in the official response schema. If unsure about a field, omit it.
+Use placeholder values like "<string>", "<integer>", "<boolean>", ["<item>"], etc.
+No explanation, no markdown, no code fences. Raw JSON only."""
+
+    response_model = model or os.getenv("MOTO_LLM_OPENAI_MODEL", "gpt-5.4-mini")
+
+    schema = _get_cached_schema(service, action, schema_prompt, model=response_model, timeout=timeout)
+
+    response_prompt = f"""You are an AWS API simulator. Generate a realistic fake response for the following AWS API request.
+
+AWS service: {service}
+AWS action: {action}
+Request body: {request_body}
+
+The response must follow this exact schema:
+{schema}
+
+Rules:
+- Output ONLY a raw JSON object. No markdown, no code fences, no explanation.
+- Follow the schema field names and types exactly. Do NOT add any fields that are not in the schema.
+- Use realistic fake values (fake ARNs, UUIDs, timestamps).
+- Validate input parameter formats only. If any input format is invalid (wrong type, malformed string, etc.), return: {{"__type": "<AWSErrorCode>", "message": "<exact AWS error message>"}}
+- If inputs are valid, always return a successful response. Never return resource-not-found errors — assume all referenced resources exist."""
+
+    return call_gpt_api(response_prompt, model=response_model, timeout=timeout)
 
 
 def call_claude_api(
@@ -157,25 +240,12 @@ def _post_json(
     timeout: float,
 ) -> dict[str, Any]:
     # JSON POST 요청을 보내고 JSON 객체를 돌려주는 공통 헬퍼 함수다.
+    # urllib 대신 requests를 사용해 WSGI 서버의 소켓 타임아웃 영향을 피한다.
 
-    request = Request(
-        # urllib가 사용할 Request 객체를 만든다.
-        url=url,
-        # 요청 URL을 넣는다.
-        headers=headers,
-        # 요청 헤더를 넣는다.
-        data=json.dumps(payload).encode("utf-8"),
-        # payload를 JSON 문자열로 만든 뒤 바이트로 인코딩해 body에 넣는다.
-        method="POST",
-        # HTTP 메서드를 POST로 지정한다.
-    )
+    resp = _requests.post(url, headers=headers, json=payload, timeout=timeout)
+    resp.raise_for_status()
 
-    with urlopen(request, timeout=timeout) as response:
-        # 지정한 timeout으로 실제 HTTP 요청을 보낸다.
-        raw = response.read().decode("utf-8")
-        # 응답 body 전체를 읽고 UTF-8 문자열로 디코딩한다.
-
-    parsed = json.loads(raw)
+    parsed = resp.json()
     # 응답 문자열을 JSON으로 파싱한다.
 
     if not isinstance(parsed, dict):

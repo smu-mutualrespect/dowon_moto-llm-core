@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import time
 from collections import OrderedDict, defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -27,11 +28,80 @@ from moto import settings
 from moto.core.authorization import ActionAuthenticatorMixin
 from moto.core.common_types import TYPE_IF_NONE, TYPE_RESPONSE
 from moto.core.exceptions import ServiceException
+import datetime
+
 from moto.core.llm_fallback import (
     build_llm_fallback_json,
     call_claude_api,
     call_gpt_api,
+    call_gpt_api_two_step,
 )
+
+
+def _build_fallback_prompt(service: str, action: str, request_body: Any) -> str:
+    # LLM에게 보낼 fallback 프롬프트를 만든다.
+    return f"""You are an AWS API simulator. You must respond exactly like the real AWS CLI would.
+
+---
+STEP 1: VALIDATE INPUTS
+Check every field in the request body strictly against the real AWS {service} {action} API specification.
+Validation rules to apply:
+- Required fields must be present and non-empty.
+- String formats must be correct (e.g. SHA256 digests must be "sha256:" followed by exactly 64 lowercase hex characters, ARNs must follow "arn:aws:<service>:<region>:<account-id>:<resource>" format).
+- Enum values must be one of the documented allowed values.
+- Numeric ranges must be within AWS-documented limits.
+- Array lengths must be within AWS-documented limits.
+
+If validation fails:
+- Return ONLY this JSON (no extra fields):
+  {{"__type": "<ExactAWSErrorCode>", "message": "<exact error message that real AWS CLI returns for this violation>"}}
+- Use the exact error code and message wording that real AWS returns. Do not invent error messages.
+
+---
+STEP 2: GENERATE RESPONSE (only if ALL inputs pass validation)
+Return a JSON response that is structurally identical to what the real AWS {service} {action} API returns.
+Requirements:
+- Include ALL fields that the real AWS response always returns (including empty arrays like "failures": []).
+- Use the exact field names from the AWS API (camelCase, correct spelling).
+- Field value types must match exactly (string vs object vs array).
+- Use realistic fake values: fake ARNs as "arn:aws:{service}:us-east-1:123456789012:...", random UUIDs, ISO 8601 timestamps.
+- IMPORTANT: This is a mock server. If input parameter formats are valid, you MUST return a successful response. Never put valid inputs into failure/error fields. The "failures" array and similar error fields must only be used when the input format itself is invalid (handled in STEP 1). Do not second-guess whether resources exist — they always do in this mock.
+
+---
+OUTPUT RULES (mandatory):
+- Output ONLY the raw JSON object. Absolutely no markdown, no code fences, no explanation, no extra text.
+- Do not wrap in ```json``` or any other formatting.
+
+Request:
+  service: {service}
+  action: {action}
+  body: {request_body}"""
+
+
+def _save_llm_response(service: str, action: str, request_body: Any, response_text: str, elapsed: float) -> None:
+    # LLM fallback 응답을 ~/moto_llm_responses.json 에 누적 저장한다.
+    log_path = os.path.join(os.path.expanduser("~"), "moto_llm_responses.json")
+    try:
+        existing: list[Any] = []
+        if os.path.exists(log_path):
+            with open(log_path, "r") as f:
+                existing = json.load(f)
+        try:
+            parsed_response = json.loads(response_text)
+        except Exception:
+            parsed_response = response_text
+        existing.append({
+            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            "elapsed_seconds": round(elapsed, 3),
+            "service": service,
+            "action": action,
+            "request": request_body,
+            "response": parsed_response,
+        })
+        with open(log_path, "w") as f:
+            json.dump(existing, f, indent=2)
+    except Exception:
+        pass
 from moto.core.model import OperationModel, ServiceModel
 from moto.core.parse import PROTOCOL_PARSERS, XFormedDict
 from moto.core.request import determine_request_protocol, normalize_request
@@ -613,20 +683,15 @@ class BaseResponse(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
                 response = http_error.description, response_headers  # type: ignore[assignment]
             except NotImplementedError as not_implemented_error:
                 # 핸들러는 찾았지만 내부 구현이 비어 있을 때 LLM fallback을 시도한다.
-                prompt = f"""
-                service={self.service_name}
-                action={action}
-                url={self.uri}
-                headers={dict(self.headers)}
-                body={self.body}
-                reason={str(not_implemented_error)}
-                source=responses.call_action.method_not_implemented
-                """
                 try:
+                    _t0 = time.monotonic()
                     if os.getenv("MOTO_LLM_PROVIDER", "").lower() == "claude":
+                        prompt = _build_fallback_prompt(self.service_name, action, self.body)
                         fallback_text = call_claude_api(prompt)
                     else:
-                        fallback_text = call_gpt_api(prompt)
+                        fallback_text = call_gpt_api_two_step(self.service_name, action, self.body)
+                    _elapsed = time.monotonic() - _t0
+                    _save_llm_response(self.service_name, action, self.body, fallback_text, _elapsed)
                     return 200, headers, fallback_text
                 except Exception:
                     # fallback 호출이 실패하면 실험용 JSON 응답을 반환한다.
@@ -648,20 +713,11 @@ class BaseResponse(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
 
         if not action:
             # action 자체를 읽지 못한 요청에 대해 마지막 fallback을 시도한다.
-            prompt = f"""
-                service={self.service_name}
-                action=None
-                url={self.uri}
-                headers={dict(self.headers)}
-                body={self.body}
-                reason=Could not determine action from request
-                source=responses.call_action.missing_action
-                """
             try:
                 if os.getenv("MOTO_LLM_PROVIDER", "").lower() == "claude":
-                    fallback_text = call_claude_api(prompt)
+                    fallback_text = call_claude_api(_build_fallback_prompt(self.service_name, "unknown", self.body))
                 else:
-                    fallback_text = call_gpt_api(prompt)
+                    fallback_text = call_gpt_api_two_step(self.service_name, "unknown", self.body)
                 return 200, headers, fallback_text
             except Exception:
                 # fallback 호출이 실패하면 실험용 JSON 응답을 반환한다.
@@ -671,19 +727,10 @@ class BaseResponse(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
 
         try:
             # action은 알지만 핸들러 메서드가 없을 때 LLM fallback을 시도한다.
-            prompt = f"""
-                service={self.service_name}
-                action={action}
-                url={self.uri}
-                headers={dict(self.headers)}
-                body={self.body}
-                reason=The action handler does not exist in moto
-                source=responses.call_action.missing_handler
-                """
             if os.getenv("MOTO_LLM_PROVIDER", "").lower() == "claude":
-                fallback_text = call_claude_api(prompt)
+                fallback_text = call_claude_api(_build_fallback_prompt(self.service_name, action, self.body))
             else:
-                fallback_text = call_gpt_api(prompt)
+                fallback_text = call_gpt_api_two_step(self.service_name, action, self.body)
             return 200, headers, fallback_text
         except Exception:
             # fallback 호출이 실패하면 실험용 JSON 응답을 반환한다.
