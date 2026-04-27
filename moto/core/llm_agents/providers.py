@@ -1,18 +1,13 @@
 from __future__ import annotations
-# 미래형 타입 힌트를 문자열 평가 없이 사용할 수 있게 한다.
-
-import json
-# HTTP 요청/응답 body를 JSON으로 직렬화/역직렬화할 때 사용한다.
 
 import os
-# API 키와 기본 모델명을 환경변수에서 읽기 위해 사용한다.
-
 import pathlib
-# .env 파일 경로를 찾기 위해 사용한다.
+from typing import Any, NamedTuple, Optional
+
+import requests as _requests
 
 
 def _load_dotenv() -> None:
-    # ~/.env 파일을 읽어 환경변수에 없는 키만 os.environ에 추가한다.
     env_path = pathlib.Path.home() / ".env"
     if not env_path.exists():
         return
@@ -30,11 +25,11 @@ def _load_dotenv() -> None:
 
 _load_dotenv()
 
-from typing import Any, Optional
-# 함수 시그니처에 사용하는 타입 힌트를 가져온다.
 
-import requests as _requests
-# urllib 대신 requests를 사용해 WSGI 환경의 소켓 타임아웃 영향을 피한다.
+class LLMResult(NamedTuple):
+    text: str
+    input_tokens: int
+    output_tokens: int
 
 
 def call_gpt_api(
@@ -42,125 +37,40 @@ def call_gpt_api(
     *,
     model: Optional[str] = None,
     timeout: float = 20.0,
-) -> str:
-    # OpenAI Responses API를 호출해서 텍스트 응답을 받아오는 함수다.
-
+) -> LLMResult:
     api_key = os.getenv("OPENAI_API_KEY")
-    # OpenAI API 키를 환경변수에서 읽는다.
-
     if not api_key:
-        # API 키가 없으면 바로 예외를 발생시킨다.
         raise ValueError("OPENAI_API_KEY is not set")
 
     payload = {
-        # OpenAI API에 보낼 JSON 요청 body를 만든다.
-        "model": model or os.getenv("MOTO_LLM_OPENAI_MODEL", "gpt-5-mini"),
-        # 호출에 사용할 모델명을 정한다. 인자가 없으면 환경변수, 그것도 없으면 기본값을 쓴다.
-        "input": [
-            # Responses API의 공식 message 배열 형태로 입력을 보낸다.
-            {
-                "role": "user",
-                # 이 메시지가 사용자 입력이라는 뜻이다.
-                "content": prompt,
-                # 실제 프롬프트 문자열을 담는다.
-            }
-        ],
+        "model": model or os.getenv("MOTO_LLM_OPENAI_MODEL", "gpt-4o-mini"),
+        "input": [{"role": "user", "content": prompt}],
     }
 
     response = _post_json(
-        # 공통 POST 함수로 OpenAI Responses API를 호출한다.
         url="https://api.openai.com/v1/responses",
-        # OpenAI Responses API 엔드포인트다.
         headers={
-            # OpenAI 요청에 필요한 HTTP 헤더를 만든다.
             "Authorization": f"Bearer {api_key}",
-            # Bearer 토큰 방식으로 API 키를 전달한다.
             "Content-Type": "application/json",
-            # 요청 body가 JSON이라는 것을 명시한다.
         },
         payload=payload,
-        # 위에서 만든 요청 body를 전달한다.
         timeout=timeout,
-        # 네트워크 대기 시간을 초 단위로 전달한다.
     )
 
     parts: list[str] = []
-    # 응답 안의 텍스트 조각들을 모을 리스트를 만든다.
-
     for item in response.get("output", []):
-        # OpenAI 응답의 output 배열을 순회한다.
         for content in item.get("content", []):
-            # 각 output 항목 안의 content 배열을 순회한다.
             if content.get("type") == "output_text":
-                # 텍스트 출력 항목만 골라낸다.
                 text = content.get("text")
-                # 실제 생성된 텍스트를 읽는다.
                 if text:
-                    # 비어 있지 않은 텍스트만 추가한다.
                     parts.append(text)
 
-    return "\n".join(parts).strip()
-    # 여러 텍스트 조각을 하나의 문자열로 합쳐 최종 응답으로 돌려준다.
-
-
-# service+action 조합별 스키마를 메모리에 캐싱한다.
-_schema_cache: dict[str, str] = {}
-
-
-def _get_cached_schema(
-    service: str,
-    action: str,
-    prompt: str,
-    *,
-    model: Optional[str] = None,
-    timeout: float = 20.0,
-) -> str:
-    # 캐시에 있으면 GPT 호출 없이 바로 반환하고, 없으면 GPT에 물어보고 저장한다.
-    cache_key = f"{service}.{action}"
-    if cache_key not in _schema_cache:
-        _schema_cache[cache_key] = call_gpt_api(prompt, model=model, timeout=timeout)
-    return _schema_cache[cache_key]
-
-
-def call_gpt_api_two_step(
-    service: str,
-    action: str,
-    request_body: str,
-    *,
-    model: Optional[str] = None,
-    timeout: float = 20.0,
-) -> str:
-    # 2단계로 GPT를 호출한다.
-    # 1단계: 해당 action의 실제 AWS 응답 스키마를 얻는다.
-    # 2단계: 스키마 기반으로 실제 요청에 맞는 응답을 생성한다.
-
-    schema_prompt = f"""What fields does the real AWS {service} {action} API response contain?
-Return ONLY the fields that are documented in the official AWS API reference for this action.
-Do NOT add any fields that you are not 100% certain are in the official response schema. If unsure about a field, omit it.
-Use placeholder values like "<string>", "<integer>", "<boolean>", ["<item>"], etc.
-No explanation, no markdown, no code fences. Raw JSON only."""
-
-    response_model = model or os.getenv("MOTO_LLM_OPENAI_MODEL", "gpt-5.4-mini")
-
-    schema = _get_cached_schema(service, action, schema_prompt, model=response_model, timeout=timeout)
-
-    response_prompt = f"""You are an AWS API simulator. Generate a realistic fake response for the following AWS API request.
-
-AWS service: {service}
-AWS action: {action}
-Request body: {request_body}
-
-The response must follow this exact schema:
-{schema}
-
-Rules:
-- Output ONLY a raw JSON object. No markdown, no code fences, no explanation.
-- Follow the schema field names and types exactly. Do NOT add any fields that are not in the schema.
-- Use realistic fake values (fake ARNs, UUIDs, timestamps).
-- Validate input parameter formats only. If any input format is invalid (wrong type, malformed string, etc.), return: {{"__type": "<AWSErrorCode>", "message": "<exact AWS error message>"}}
-- If inputs are valid, always return a successful response. Never return resource-not-found errors — assume all referenced resources exist."""
-
-    return call_gpt_api(response_prompt, model=response_model, timeout=timeout)
+    usage = response.get("usage", {})
+    return LLMResult(
+        text="\n".join(parts).strip(),
+        input_tokens=usage.get("input_tokens", 0),
+        output_tokens=usage.get("output_tokens", 0),
+    )
 
 
 def call_claude_api(
@@ -168,68 +78,73 @@ def call_claude_api(
     *,
     model: Optional[str] = None,
     timeout: float = 20.0,
-) -> str:
-    # Anthropic Messages API를 호출해서 텍스트 응답을 받아오는 함수다.
-
+) -> LLMResult:
     api_key = os.getenv("ANTHROPIC_API_KEY")
-    # Anthropic API 키를 환경변수에서 읽는다.
-
     if not api_key:
-        # API 키가 없으면 바로 예외를 발생시킨다.
         raise ValueError("ANTHROPIC_API_KEY is not set")
 
     payload = {
-        # Anthropic API에 보낼 JSON 요청 body를 만든다.
-        "model": model
-        or os.getenv("MOTO_LLM_ANTHROPIC_MODEL", "claude-3-5-sonnet-latest"),
-        # 사용할 Claude 모델명을 정한다. 인자가 우선이고, 없으면 환경변수, 그것도 없으면 기본값을 쓴다.
+        "model": model or os.getenv("MOTO_LLM_ANTHROPIC_MODEL", "claude-3-5-sonnet-latest"),
         "max_tokens": 2000,
-        # Claude가 생성할 최대 토큰 수를 정한다.
-        "messages": [
-            # Anthropic Messages API의 공식 messages 배열을 구성한다.
-            {
-                "role": "user",
-                # 사용자 메시지라는 뜻이다.
-                "content": prompt,
-                # 실제 프롬프트 문자열을 넣는다.
-            }
-        ],
+        "messages": [{"role": "user", "content": prompt}],
     }
 
     response = _post_json(
-        # 공통 POST 함수로 Anthropic Messages API를 호출한다.
         url="https://api.anthropic.com/v1/messages",
-        # Anthropic Messages API 엔드포인트다.
         headers={
-            # Anthropic 요청에 필요한 HTTP 헤더를 만든다.
             "x-api-key": api_key,
-            # Anthropic 전용 API 키 헤더다.
             "anthropic-version": "2023-06-01",
-            # 사용할 API 버전을 명시한다.
             "content-type": "application/json",
-            # 요청 body가 JSON이라는 것을 명시한다.
         },
         payload=payload,
-        # 위에서 만든 요청 body를 전달한다.
         timeout=timeout,
-        # 네트워크 대기 시간을 초 단위로 전달한다.
     )
 
     parts: list[str] = []
-    # 응답 안의 텍스트 조각들을 모을 리스트를 만든다.
-
     for item in response.get("content", []):
-        # Anthropic 응답의 content 배열을 순회한다.
         if item.get("type") == "text":
-            # 텍스트 타입 블록만 골라낸다.
             text = item.get("text")
-            # 실제 생성된 텍스트를 읽는다.
             if text:
-                # 비어 있지 않은 텍스트만 추가한다.
                 parts.append(text)
 
-    return "\n".join(parts).strip()
-    # 여러 텍스트 조각을 하나의 문자열로 합쳐 최종 응답으로 돌려준다.
+    usage = response.get("usage", {})
+    return LLMResult(
+        text="\n".join(parts).strip(),
+        input_tokens=usage.get("input_tokens", 0),
+        output_tokens=usage.get("output_tokens", 0),
+    )
+
+
+def call_gpt_with_tools(
+    messages: list[dict],
+    tools: list[dict],
+    *,
+    model: Optional[str] = None,
+    timeout: float = 30.0,
+) -> tuple[dict, int, int]:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY is not set")
+
+    payload = {
+        "model": model or os.getenv("MOTO_LLM_OPENAI_MODEL", "gpt-4o-mini"),
+        "messages": messages,
+        "tools": tools,
+        "tool_choice": "auto",
+    }
+
+    resp = _requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    message = data["choices"][0]["message"]
+    usage = data.get("usage", {})
+    return message, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0)
 
 
 def _post_json(
@@ -239,18 +154,9 @@ def _post_json(
     payload: dict[str, Any],
     timeout: float,
 ) -> dict[str, Any]:
-    # JSON POST 요청을 보내고 JSON 객체를 돌려주는 공통 헬퍼 함수다.
-    # urllib 대신 requests를 사용해 WSGI 서버의 소켓 타임아웃 영향을 피한다.
-
     resp = _requests.post(url, headers=headers, json=payload, timeout=timeout)
     resp.raise_for_status()
-
     parsed = resp.json()
-    # 응답 문자열을 JSON으로 파싱한다.
-
     if not isinstance(parsed, dict):
-        # 최상위 JSON이 객체가 아니면 예상한 형식이 아니라고 본다.
         raise ValueError("Expected JSON object response")
-
     return parsed
-    # 파싱된 JSON 객체를 호출자에게 돌려준다.
