@@ -1,94 +1,129 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
+import logging
+import os
+import re
+from typing import Any
 
-if TYPE_CHECKING:
-    from moto.core.llm_agents.session_store import AttackSession
-
+from moto.core.llm_agents.metrics import log_agent_debug, log_metric
 from moto.core.llm_agents.providers import call_gpt_api
+from moto.core.llm_agents.session_store import analyze_session
+from moto.core.llm_agents.state import SessionProfile
+
+logger = logging.getLogger("turn_agent")
+
+_ANALYST_MODEL = os.getenv("HONEYPOT_ANALYST_MODEL", "gpt-5.4-mini")
+_ANALYST_TEMP = float(os.getenv("HONEYPOT_ANALYST_TEMP", "0.2"))
+
+_ANALYST_SYSTEM = """\
+You are a cybersecurity analyst monitoring an AWS API honeypot.
+Analyze the session history to understand the attacker's intent and predict their next move.
+
+Output ONLY valid JSON:
+{
+  "attack_stage": "recon|cred_access|privesc|exfil",
+  "attacker_type": "unknown|script_kiddie|insider|apt",
+  "confidence": 0.0,
+  "intent": "<one sentence: what the attacker specifically wants to achieve>",
+  "predicted_next": ["service:OperationName"],
+  "deception_hint": "<one sentence: what fake resource to plant to trap this attacker>",
+  "summary": "<brief 1-2 sentence analysis>"
+}
+
+Guidelines:
+- predicted_next: 1-2 most likely next AWS API calls based on the pattern
+- deception_hint: be specific (e.g. "plant a fake RDS password in secretsmanager named prod/rds/master")
+- attacker_type: script_kiddie=broad scanning, insider=uses internal resource names, apt=stealthy focused
+"""
 
 
-def analyze(session: "AttackSession") -> tuple[dict, int, int]:
-    prompt = _build_prompt(session)
-    try:
-        result = call_gpt_api(prompt)
-        output = json.loads(result.text)
-        _validate(output)
-        return output, result.input_tokens, result.output_tokens
-    except Exception:
-        fallback = _rule_based_fallback(session)
-        return fallback, 0, 0
+def analyst_agent(
+    session_id: str,
+    history: list[str],
+    current_body: dict[str, Any] | None = None,
+) -> SessionProfile:
+    profile = analyze_session(history, current_body)
+    log_metric(
+        "analyst",
+        session=session_id,
+        turn=len(history),
+        attack_stage=profile["attack_stage"],
+        attacker_type=profile["attacker_type"],
+        confidence=profile["confidence"],
+        summary=profile["summary"],
+        source="rules",
+    )
+    return profile
 
 
-def _build_prompt(session: "AttackSession") -> str:
-    recent_actions = session.actions[-10:]
-    formatted_actions = "\n".join(
-        f"  [{i+1}] {a['service']}:{a['action']} | bait_hit={a.get('matched_bait')}"
-        for i, a in enumerate(recent_actions)
+def llm_analyst_agent(
+    session_id: str,
+    history: list[str],
+    current_body: dict[str, Any] | None = None,
+) -> SessionProfile:
+    base = analyze_session(history, current_body)
+    if not history:
+        return base
+
+    prompt = (
+        f"session_id={session_id}\n"
+        f"history={json.dumps(history[-15:], ensure_ascii=False, separators=(',', ':'))}\n"
+        f"current_body={json.dumps(current_body or {}, ensure_ascii=False, separators=(',', ':'))}\n"
+        f"rule_stage={base['attack_stage']}\n"
+        f"rule_attacker_type={base['attacker_type']}\n"
     )
 
-    baits_planted = [b for b in session.baits]
-    baits_taken = [b for b in session.baits if b.status == "taken"]
+    try:
+        raw, usage = call_gpt_api(
+            prompt,
+            model=_ANALYST_MODEL,
+            system_prompt=_ANALYST_SYSTEM,
+            temperature=_ANALYST_TEMP,
+            timeout=20.0,
+        )
+        start = raw.find("{")
+        if start == -1:
+            raise ValueError("No JSON in analyst response")
+        parsed, _ = json.JSONDecoder().raw_decode(raw, start)
 
-    return f"""You are a security analyst monitoring a honeypot AWS environment.
-Analyze the following attack session and determine the current threat status.
+        profile: SessionProfile = {
+            "attack_stage": str(parsed.get("attack_stage", base["attack_stage"])),
+            "attacker_type": str(parsed.get("attacker_type", base["attacker_type"])),
+            "confidence": float(parsed.get("confidence", base["confidence"])),
+            "summary": str(parsed.get("summary", base["summary"])),
+            "intent": str(parsed.get("intent", "")),
+            "predicted_next": [str(x) for x in parsed.get("predicted_next", [])],
+            "deception_hint": str(parsed.get("deception_hint", "")),
+        }
+        log_metric(
+            "analyst",
+            session=session_id,
+            turn=len(history),
+            attack_stage=profile["attack_stage"],
+            attacker_type=profile["attacker_type"],
+            confidence=profile["confidence"],
+            summary=profile["summary"],
+            source="llm",
+            intent=profile["intent"],
+            predicted_next=profile["predicted_next"],
+        )
+        log_agent_debug(
+            "llm_analyst",
+            session_id,
+            turn=len(history),
+            elapsed_ms=usage.get("elapsed_ms", 0.0),
+            input_tokens=usage.get("input_tokens", 0),
+            output_tokens=usage.get("output_tokens", 0),
+            response_content=raw,
+            extra={
+                "attack_stage": profile["attack_stage"],
+                "attacker_type": profile["attacker_type"],
+                "intent": profile["intent"],
+            },
+        )
+        return profile
 
-Total requests so far: {session.request_count}
-
-Recent API calls (latest up to 10):
-{formatted_actions}
-
-Baits planted: {len(baits_planted)} | Baits taken: {len(baits_taken)}
-
-Attack phase definitions:
-- 정찰: reconnaissance — listing resources (ListBuckets, ListUsers, DescribeInstances, GetCallerIdentity...)
-- 권한_탈취: credential theft (GetSecretValue, AssumeRole, CreateAccessKey, GetParameter...)
-- 데이터_유출: data exfiltration (GetObject, GetParameter, DownloadDBLogFilePortion...)
-- 횡적_이동: lateral movement (CreateRole, AttachRolePolicy, RunInstances, CreateFunction...)
-
-Strategy definitions:
-- observe: watch passively, return normal realistic responses
-- lure: plant enticing fake resource names in responses to draw attacker deeper
-- engage: make attacker believe they fully succeeded, return convincing fake credentials/data
-- trap: deploy canary tokens that can be tracked if used outside this environment
-
-Current session state: phase={session.current_stage}, strategy={session.current_strategy}
-
-Based on the attack pattern, return ONLY this JSON with no explanation or markdown:
-{{"phase": "<정찰|권한_탈취|데이터_유출|횡적_이동>", "threat_level": "<low|medium|high|critical>", "strategy": "<observe|lure|engage|trap>", "reasoning": "<one sentence why>"}}"""
-
-
-def _validate(output: dict) -> None:
-    valid_phases = {"정찰", "권한_탈취", "데이터_유출", "횡적_이동"}
-    valid_threats = {"low", "medium", "high", "critical"}
-    valid_strategies = {"observe", "lure", "engage", "trap"}
-    assert output.get("phase") in valid_phases
-    assert output.get("threat_level") in valid_threats
-    assert output.get("strategy") in valid_strategies
-
-
-def _rule_based_fallback(session: "AttackSession") -> dict:
-    recent = {a["action"] for a in session.actions[-5:]}
-    phase_patterns = {
-        "횡적_이동": {"CreateRole", "AttachRolePolicy", "RunInstances", "CreateFunction", "PutRolePolicy"},
-        "데이터_유출": {"GetObject", "ExportTableToPointInTime", "CopySnapshot"},
-        "권한_탈취": {"GetSecretValue", "AssumeRole", "CreateAccessKey", "GetParameter"},
-        "정찰": {"ListBuckets", "DescribeInstances", "ListUsers", "GetCallerIdentity", "ListSecrets"},
-    }
-    phase = "정찰"
-    for p, patterns in phase_patterns.items():
-        if recent & patterns:
-            phase = p
-            break
-
-    strategy = session.current_strategy
-    if session.request_count >= 3 and strategy == "observe":
-        strategy = "lure"
-
-    return {
-        "phase": phase,
-        "threat_level": "medium",
-        "strategy": strategy,
-        "reasoning": "rule-based fallback due to LLM parse error",
-    }
+    except Exception as e:
+        logger.warning("llm_analyst_agent failed: %s", e)
+        return base

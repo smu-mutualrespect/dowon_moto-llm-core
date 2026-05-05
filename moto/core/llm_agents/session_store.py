@@ -1,149 +1,150 @@
 from __future__ import annotations
 
+import re
 import threading
-import uuid
-from datetime import datetime, timezone
-from typing import Any, Optional
+from collections import defaultdict
+from typing import Any
+
+from moto.core.llm_agents.state import SessionProfile
 
 
-class Bait:
-    def __init__(self, bait_type: str, value: str, planted_at: int) -> None:
-        self.id = f"bait-{uuid.uuid4().hex[:8]}"
-        self.type = bait_type
-        self.value = value
-        self.planted_at = planted_at
-        self.status = "pending"
-        self.taken_at: Optional[int] = None
-
-    def to_dict(self) -> dict:
-        return {
-            "id": self.id,
-            "type": self.type,
-            "value": self.value,
-            "planted_at": self.planted_at,
-            "status": self.status,
-            "taken_at": self.taken_at,
-        }
+_lock = threading.RLock()
+_history: dict[str, list[str]] = defaultdict(list)
+_profiles: dict[str, SessionProfile] = {}
+_inflight_strategy: set[str] = set()
 
 
-class AttackSession:
-    def __init__(self, session_id: str) -> None:
-        self.session_id = session_id
-        self.first_seen = _now()
-        self.last_seen = self.first_seen
-        self.request_count = 0
-        self.threat_level = "unknown"
-        self.current_stage = "정찰"
-        self.current_strategy = "observe"
-        self.actions: list[dict] = []
-        self.stage_history: list[dict] = []
-        self.strategy_history: list[dict] = []
-        self.baits: list[Bait] = []
+_CRED_ACTIONS = {
+    "createaccesskey",
+    "listaccesskeys",
+    "getsecretvalue",
+    "listsecrets",
+    "getparameter",
+    "getparameters",
+    "getparametersbypath",
+}
+_PRIVESC_ACTIONS = {
+    "assumerole",
+    "attachuserpolicy",
+    "attachrolepolicy",
+    "putuserpolicy",
+    "putrolepolicy",
+    "createpolicyversion",
+    "simulateprincipalpolicy",
+}
+_EXFIL_ACTIONS = {
+    "getobject",
+    "selectobjectcontent",
+    "startqueryexecution",
+    "createdataexport",
+    "exportfindings",
+}
 
-    def record_request(
-        self,
-        service: str,
-        action: str,
-        params: dict,
-        body: Any,
-    ) -> Optional[str]:
-        matched_bait_id = self._match_baits(params)
-        self.actions.append({
-            "timestamp": _now(),
-            "service": service,
-            "action": action,
-            "params": params,
-            "body": str(body)[:500],
-            "matched_bait": matched_bait_id,
-        })
-        self.request_count += 1
-        self.last_seen = _now()
-        return matched_bait_id
 
-    def _match_baits(self, params: dict) -> Optional[str]:
-        params_str = str(params).lower()
-        for bait in self.baits:
-            if bait.status != "pending":
-                continue
-            if bait.value.lower() in params_str:
-                bait.status = "taken"
-                bait.taken_at = self.request_count
-                return bait.id
-        return None
+def get_history(session_id: str) -> list[str]:
+    with _lock:
+        return list(_history.get(session_id, []))
 
-    def register_bait(self, bait_type: str, value: str) -> Bait:
-        bait = Bait(
-            bait_type=bait_type,
-            value=value,
-            planted_at=self.request_count,
+
+def append_history(session_id: str, service: str, action: str) -> list[str]:
+    entry = f"{service}:{action}"
+    with _lock:
+        _history[session_id].append(entry)
+        return list(_history[session_id])
+
+
+def get_turn_count(session_id: str) -> int:
+    with _lock:
+        return len(_history.get(session_id, []))
+
+
+def get_profile(session_id: str) -> SessionProfile:
+    with _lock:
+        return _profiles.get(
+            session_id,
+            {
+                "attack_stage": "recon",
+                "attacker_type": "unknown",
+                "confidence": 0.0,
+                "summary": "No session analysis yet.",
+                "intent": "",
+                "predicted_next": [],
+                "deception_hint": "",
+            },
         )
-        self.baits.append(bait)
-        return bait
-
-    def update_stage_and_strategy(
-        self, stage: str, strategy: str, threat_level: str
-    ) -> None:
-        if stage != self.current_stage:
-            if self.stage_history:
-                self.stage_history[-1]["request_range"][1] = self.request_count - 1
-            self.stage_history.append({
-                "stage": stage,
-                "request_range": [self.request_count, self.request_count],
-            })
-            self.current_stage = stage
-
-        if strategy != self.current_strategy:
-            if self.strategy_history:
-                self.strategy_history[-1]["request_range"][1] = self.request_count - 1
-            self.strategy_history.append({
-                "strategy": strategy,
-                "request_range": [self.request_count, self.request_count],
-                "baits_taken": 0,
-            })
-            self.current_strategy = strategy
-
-        self.threat_level = threat_level
-
-    def baits_taken_count(self) -> int:
-        return sum(1 for b in self.baits if b.status == "taken")
-
-    def to_dict(self) -> dict:
-        return {
-            "session_id": self.session_id,
-            "first_seen": self.first_seen,
-            "last_seen": self.last_seen,
-            "request_count": self.request_count,
-            "threat_level": self.threat_level,
-            "current_stage": self.current_stage,
-            "current_strategy": self.current_strategy,
-            "actions": self.actions,
-            "stage_history": self.stage_history,
-            "strategy_history": self.strategy_history,
-            "baits": [b.to_dict() for b in self.baits],
-        }
 
 
-class SessionStore:
-    def __init__(self) -> None:
-        self._sessions: dict[str, AttackSession] = {}
-        self._lock = threading.Lock()
-
-    def get_or_create(self, session_id: str) -> AttackSession:
-        with self._lock:
-            if session_id not in self._sessions:
-                self._sessions[session_id] = AttackSession(session_id)
-            return self._sessions[session_id]
-
-    def get(self, session_id: str) -> Optional[AttackSession]:
-        return self._sessions.get(session_id)
+def update_profile(session_id: str, profile: SessionProfile) -> None:
+    with _lock:
+        _profiles[session_id] = profile
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def mark_strategy_inflight(session_id: str) -> bool:
+    with _lock:
+        if session_id in _inflight_strategy:
+            return False
+        _inflight_strategy.add(session_id)
+        return True
 
 
-_store = SessionStore()
+def clear_strategy_inflight(session_id: str) -> None:
+    with _lock:
+        _inflight_strategy.discard(session_id)
 
 
-def get_store() -> SessionStore:
-    return _store
+def analyze_session(history: list[str], current_body: dict[str, Any] | None = None) -> SessionProfile:
+    actions = [_action_name(item) for item in history]
+    services = {_service_name(item) for item in history}
+
+    stage = "recon"
+    confidence = 0.55 if history else 0.0
+    if any(action in _EXFIL_ACTIONS for action in actions):
+        stage, confidence = "exfil", 0.85
+    elif any(action in _PRIVESC_ACTIONS for action in actions):
+        stage, confidence = "privesc", 0.82
+    elif any(action in _CRED_ACTIONS for action in actions):
+        stage, confidence = "cred_access", 0.8
+
+    attacker_type = "unknown"
+    if len(history) >= 8 and len(services) >= 4:
+        attacker_type = "script_kiddie"
+    if _looks_like_internal_knowledge(history, current_body or {}):
+        attacker_type = "insider"
+        confidence = max(confidence, 0.75)
+    if len(history) >= 6 and 1 <= len(services) <= 2 and stage != "recon":
+        attacker_type = "apt"
+        confidence = max(confidence, 0.78)
+
+    summary = _summarize(history, stage, attacker_type)
+    return {
+        "attack_stage": stage,
+        "attacker_type": attacker_type,
+        "confidence": confidence,
+        "summary": summary,
+        "intent": "",
+        "predicted_next": [],
+        "deception_hint": "",
+    }
+
+
+def _service_name(entry: str) -> str:
+    return entry.split(":", 1)[0].lower()
+
+
+def _action_name(entry: str) -> str:
+    if ":" in entry:
+        entry = entry.split(":", 1)[1]
+    return re.sub(r"[^a-z0-9]", "", entry.lower())
+
+
+def _looks_like_internal_knowledge(history: list[str], body: dict[str, Any]) -> bool:
+    text = " ".join(history + [str(v) for v in body.values()]).lower()
+    markers = ("prod-", "production", "payroll", "finance", "backup", "root", "admin", "breakglass")
+    return any(marker in text for marker in markers)
+
+
+def _summarize(history: list[str], stage: str, attacker_type: str) -> str:
+    if not history:
+        return "No previous commands."
+    tail = ", ".join(history[-5:])
+    return f"{len(history)} commands observed; recent={tail}; stage={stage}; type={attacker_type}."
