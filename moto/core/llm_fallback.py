@@ -4,8 +4,23 @@ from __future__ import annotations
 import json
 # fallback 확인용 JSON body를 만들 때 사용한다.
 
-from moto.core.llm_agents import call_claude_api, call_gpt_api, call_gpt_api_two_step
+from moto.core.llm_agents import call_claude_api, call_gpt_api
 # 실제 LLM API 호출 구현은 llm_agents 패키지에서 가져온다.
+
+
+def call_gpt_api_two_step(service: str, action: str, request_body: object) -> str:
+    # Older fallback code expects a two-step helper. Keep a small compatibility
+    # wrapper here so server imports do not fail and GPT fallback still works.
+    prompt = f"""You are an AWS API simulator.
+
+Generate a realistic successful AWS response body for this request.
+Return only the raw response body. Do not explain.
+
+service={service}
+action={action}
+request_body={json.dumps(request_body, ensure_ascii=False, default=str)}
+"""
+    return call_gpt_api(prompt)
 
 
 def build_llm_fallback_json(message: str = "llm_fallback!!") -> tuple[dict[str, str], str]:

@@ -141,7 +141,7 @@ def _schedule_background_jobs(
     base_state: AgentState,
     schema: Any,
 ) -> None:
-    # analyst: 매 5턴마다 실행
+    # LLM analyst는 비용/지연이 크므로 일정 턴마다만 실행한다.
     if len(history) % _BACKGROUND_AFTER_TURNS == 0:
         worker = threading.Thread(
             target=_run_analysis_job,
@@ -151,7 +151,6 @@ def _schedule_background_jobs(
         )
         worker.start()
 
-    # strategy: turn 1 + attack_stage 변경 시
     profile = get_profile(session_id)
     stage_changed = profile["attack_stage"] != base_state["attack_stage"]
     if (

@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 
 
-_DEFAULT_SERVICES = "sts,iam,s3,secretsmanager,ssm"
+_DEFAULT_SERVICES = "sts,iam,s3,secretsmanager,ssm,cloudtrail"
 
 
 def should_intercept_native(service: str | None, action: str | None = None) -> bool:
