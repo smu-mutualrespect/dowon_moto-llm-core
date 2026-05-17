@@ -73,6 +73,7 @@ def get_service_schema(
             "required_input": required,
             "schema_prompt": _compact_schema_prompt(output_schema),
             "xmlns": xmlns,
+            "http_success_code": op.http.get("responseCode", 200),
         }
     except Exception as e:
         logger.debug("operation_model failed for %s/%s: %s", service, action, e)

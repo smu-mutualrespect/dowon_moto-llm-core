@@ -66,6 +66,7 @@ def run(
         content_type = schema["content_type"]
     else:
         content_type = "application/json"
+        logger.warning("[SCHEMA_MISS] session=%s service=%s action=%s url=%s", session_id, service, action, url_path)
 
     active_decoys = list_decoys(session_id)
     decoy_hit = detect_decoy_hit(session_id, service, action, parsed_body)
@@ -140,19 +141,21 @@ def _schedule_background_jobs(
     base_state: AgentState,
     schema: Any,
 ) -> None:
-    worker = threading.Thread(
-        target=_run_analysis_job,
-        args=(session_id, list(history), body, dict(base_state)),
-        daemon=True,
-        name=f"hpot-analysis-{session_id}",
-    )
-    worker.start()
+    # analyst: 매 5턴마다 실행
+    if len(history) % _BACKGROUND_AFTER_TURNS == 0:
+        worker = threading.Thread(
+            target=_run_analysis_job,
+            args=(session_id, list(history), body, dict(base_state)),
+            daemon=True,
+            name=f"hpot-analysis-{session_id}",
+        )
+        worker.start()
 
-    # strategy는 별도 조건 충족 시만 실행
+    # strategy: turn 1 + attack_stage 변경 시
     profile = get_profile(session_id)
+    stage_changed = profile["attack_stage"] != base_state["attack_stage"]
     if (
-        len(history) >= _BACKGROUND_AFTER_TURNS
-        and profile["attack_stage"] in ("cred_access", "privesc", "exfil")
+        (len(history) == 1 or stage_changed)
         and mark_strategy_inflight(session_id)
     ):
         strat_worker = threading.Thread(

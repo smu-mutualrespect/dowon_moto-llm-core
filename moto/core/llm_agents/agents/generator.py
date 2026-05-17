@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import uuid
 from typing import Any
 
 from moto.core.llm_agents.metrics import log_agent_debug
@@ -27,6 +28,7 @@ Rules:
 - aws_response is ALWAYS a JSON object string regardless of protocol. Format conversion is handled externally.
 - Output ONLY the JSON envelope. Zero explanation, zero markdown, zero extra text after the closing brace.
 - Use only fields present in output_schema. Do not invent field names.
+- Omit fields with empty values ("", [], {}). Include null only if it represents an explicitly unset optional field per AWS behavior.
 - Generate realistic values: real-looking ARNs, UUIDs, AKIA-prefixed key IDs, ISO timestamps.
 - If request_valid is false, return the provided error body verbatim.
 - Preserve active decoys in the response when relevant to the service/action.
@@ -88,8 +90,12 @@ def generate_agent(
     if not request_valid:
         return {"aws_response": error_body}
 
+    # Fix 1: no-output operation → LLM 호출 없이 직접 반환
+    if schema is not None and schema.get("output_schema") == {}:
+        return {"aws_response": _build_empty_response(schema)}
+
     protocol = schema.get("protocol") if schema else ("query" if state["service"] in XML_SERVICES else "json")
-    schema_prompt = schema.get("schema_prompt") if schema else "{}"
+    schema_prompt = schema.get("schema_prompt") if schema else '{"_note":"schema unavailable, generate realistic fields for this operation"}'
     operation = schema.get("operation_name") if schema else state["action"]
     decoys = _compact_decoys(state.get("active_decoys", []), state["service"])
 
@@ -189,6 +195,21 @@ def _compact_decoys(decoys: list[dict[str, str]], service: str) -> str:
         if item.get("decoy_service") in ("", service)
     ][:3]
     return json.dumps(relevant, ensure_ascii=False, separators=(",", ":"))
+
+
+def _build_empty_response(schema: dict[str, Any]) -> str:
+    protocol = schema.get("protocol", "json")
+    if protocol not in ("query", "ec2", "rest-xml"):
+        return "{}"
+    if schema.get("http_success_code") == 204:
+        return ""
+    op = schema.get("operation_name", "Response")
+    xmlns = schema.get("xmlns", "")
+    rid = str(uuid.uuid4())
+    ns = f' xmlns="{xmlns}"' if xmlns else ""
+    if protocol == "ec2":
+        return f"<{op}Response{ns}><requestId>{rid}</requestId><return>true</return></{op}Response>"
+    return f"<{op}Response{ns}><ResponseMetadata><RequestId>{rid}</RequestId></ResponseMetadata></{op}Response>"
 
 
 def _fallback_success(state: AgentState, schema: dict[str, Any] | None) -> str:

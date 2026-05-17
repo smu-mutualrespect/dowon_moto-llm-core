@@ -26,19 +26,31 @@ def list_decoys(session_id: str) -> list[dict[str, str]]:
 
 
 def detect_decoy_hit(session_id: str, service: str, action: str, body: dict[str, Any]) -> bool:
-    haystack = f"{service} {action} {body}".lower()
+    body_values = _flatten_values(body)
     hit = False
     with _lock:
         for decoy in _decoys.get(session_id, []):
-            values = [
-                decoy.get("decoy_name", ""),
-                decoy.get("decoy_value", ""),
-                decoy.get("decoy_service", ""),
+            targets = [
+                decoy.get("decoy_name", "").lower(),
+                decoy.get("decoy_value", "").lower(),
             ]
-            if any(value and value.lower() in haystack for value in values):
+            if any(t and t in body_values for t in targets):
                 _hits.setdefault(session_id, []).append(decoy)
                 hit = True
         return hit
+
+
+def _flatten_values(body: Any) -> set[str]:
+    result: set[str] = set()
+    if isinstance(body, dict):
+        for v in body.values():
+            result |= _flatten_values(v)
+    elif isinstance(body, list):
+        for item in body:
+            result |= _flatten_values(item)
+    elif body is not None:
+        result.add(str(body).lower())
+    return result
 
 
 def list_hits(session_id: str) -> list[dict[str, str]]:
