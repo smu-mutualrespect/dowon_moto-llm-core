@@ -15,9 +15,10 @@ def maybe_convert_to_xml(body: Any, schema: dict[str, Any] | None) -> str:
             return json.dumps(data, ensure_ascii=False)
         operation = schema.get("operation_name", "Response")
         xmlns = schema.get("xmlns", "")
+        loc_map = schema.get("xml_location_names", {})
         if protocol == "query":
-            return _to_query_xml(operation, data, xmlns)
-        return _to_ec2_xml(operation, data, xmlns)
+            return _to_query_xml(operation, data, xmlns, loc_map)
+        return _to_ec2_xml(operation, data, xmlns, loc_map)
     protocol = schema.get("protocol")
     if protocol not in ("query", "ec2"):
         return body
@@ -33,15 +34,16 @@ def maybe_convert_to_xml(body: Any, schema: dict[str, Any] | None) -> str:
 
     operation = schema.get("operation_name", "Response")
     xmlns = schema.get("xmlns", "")
+    loc_map = schema.get("xml_location_names", {})
 
     if protocol == "query":
-        return _to_query_xml(operation, data, xmlns)
+        return _to_query_xml(operation, data, xmlns, loc_map)
     else:  # ec2
-        return _to_ec2_xml(operation, data, xmlns)
+        return _to_ec2_xml(operation, data, xmlns, loc_map)
 
 
-def _to_query_xml(operation: str, data: dict, xmlns: str) -> str:
-    inner = _children(data)
+def _to_query_xml(operation: str, data: dict, xmlns: str, loc_map: dict) -> str:
+    inner = _children(data, list_tag="member", loc_map=loc_map)
     xmlns_attr = f' xmlns="{xmlns}"' if xmlns else ""
     result_block = f"<{operation}Result>{inner}</{operation}Result>" if inner else f"<{operation}Result/>"
     return (
@@ -52,8 +54,8 @@ def _to_query_xml(operation: str, data: dict, xmlns: str) -> str:
     )
 
 
-def _to_ec2_xml(operation: str, data: dict, xmlns: str) -> str:
-    inner = _children(data)
+def _to_ec2_xml(operation: str, data: dict, xmlns: str, loc_map: dict) -> str:
+    inner = _children(data, list_tag="item", loc_map=loc_map)
     xmlns_attr = f' xmlns="{xmlns}"' if xmlns else ""
     return (
         f"<{operation}Response{xmlns_attr}>"
@@ -63,11 +65,22 @@ def _to_ec2_xml(operation: str, data: dict, xmlns: str) -> str:
     )
 
 
-def _children(data: Any) -> str:
+def _children(data: Any, list_tag: str = "member", loc_map: dict | None = None) -> str:
     if isinstance(data, dict):
-        return "".join(f"<{k}>{_children(v)}</{k}>" for k, v in data.items())
+        parts = []
+        for k, v in data.items():
+            entry = (loc_map or {}).get(k, {}) if loc_map else {}
+            xml_name = entry.get("_loc", k) if entry else k
+            if isinstance(v, list):
+                item_tag = entry.get("__item_tag", list_tag) if entry else list_tag
+                item_map = entry.get("__item_children") if entry else None
+                parts.append(f"<{xml_name}>{_children(v, item_tag, item_map)}</{xml_name}>")
+            else:
+                child_map = entry.get("_children") if entry else None
+                parts.append(f"<{xml_name}>{_children(v, list_tag, child_map)}</{xml_name}>")
+        return "".join(parts)
     if isinstance(data, list):
-        return "".join(f"<member>{_children(item)}</member>" for item in data)
+        return "".join(f"<{list_tag}>{_children(item, list_tag, loc_map)}</{list_tag}>" for item in data)
     if isinstance(data, bool):
         return "true" if data else "false"
     if data is None:

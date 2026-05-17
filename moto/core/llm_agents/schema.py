@@ -64,6 +64,7 @@ def get_service_schema(
         output_schema = _shape_to_dict(op.output_shape)
         input_schema = _shape_to_dict(op.input_shape, max_depth=3)
         required = list(getattr(op.input_shape, "required_members", []) or []) if op.input_shape else []
+        xml_loc = _extract_location_names(op.output_shape) if protocol in ("ec2", "query", "rest-xml") else {}
         return {
             "protocol": protocol,
             "content_type": protocol_to_content_type(protocol, json_version),
@@ -74,6 +75,7 @@ def get_service_schema(
             "schema_prompt": _compact_schema_prompt(output_schema),
             "xmlns": xmlns,
             "http_success_code": op.http.get("responseCode", 200),
+            "xml_location_names": xml_loc,
         }
     except Exception as e:
         logger.debug("operation_model failed for %s/%s: %s", service, action, e)
@@ -177,6 +179,37 @@ def _compact_schema_prompt(schema: Any, max_chars: int = 1800) -> str:
         }
         return json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
     return '{"_schema_compacted":true}'
+
+
+def _extract_location_names(shape: Any, depth: int = 0, max_depth: int = 5) -> dict:
+    """Python 키명 → XML locationName 매핑을 재귀적으로 추출.
+
+    구조체 필드마다: {"_loc": xml_name, "_children": {...}}
+    리스트 필드면: {"_loc": xml_name, "__item_tag": tag, "__item_children": {...}}
+    """
+    if shape is None or depth > max_depth:
+        return {}
+    result: dict = {}
+    try:
+        if shape.type_name != "structure":
+            return result
+        for name, member in shape.members.items():
+            loc = member.serialization.get("name", name)
+            entry: dict = {"_loc": loc}
+            if member.type_name == "list":
+                item_tag = member.member.serialization.get("name", "item")
+                entry["__item_tag"] = item_tag
+                item_children = _extract_location_names(member.member, depth + 1, max_depth)
+                if item_children:
+                    entry["__item_children"] = item_children
+            else:
+                child = _extract_location_names(member, depth + 1, max_depth)
+                if child:
+                    entry["_children"] = child
+            result[name] = entry
+    except Exception:
+        pass
+    return result
 
 
 def _prune_schema(value: Any, depth: int = 0, max_depth: int = 3, max_members: int = 8) -> Any:
