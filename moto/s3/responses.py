@@ -237,21 +237,6 @@ class S3Response(BaseResponse):
         return 204, {}, ""
 
     def all_buckets(self) -> TYPE_RESPONSE:
-        from moto.core.llm_agents.intercept import should_intercept_native
-
-        if should_intercept_native("s3", "ListBuckets"):
-            from moto.core.llm_agents import turn_agent
-
-            resp_headers, resp_body = turn_agent.run(
-                url=self.uri,
-                headers=dict(self.headers),
-                body={},
-                source=getattr(self, "access_key", "unknown"),
-                service="s3",
-                action="ListBuckets",
-            )
-            return 200, resp_headers, resp_body
-
         self.data["Action"] = "ListAllMyBuckets"
         self._authenticate_and_authorize_s3_action()
 

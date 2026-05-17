@@ -38,50 +38,6 @@ from moto.core.llm_fallback import (
 )
 
 
-_HONEYPOT_EARLY_OVERRIDE = os.getenv("HONEYPOT_EARLY_OVERRIDE", "true").lower() not in {
-    "0",
-    "false",
-    "no",
-}
-_HONEYPOT_EARLY_SERVICES = {
-    "sts",
-    "iam",
-    "s3",
-    "secretsmanager",
-    "ssm",
-    "cloudtrail",
-}
-_HONEYPOT_WEAK_MARKERS = (
-    "default_user",
-    "arn:aws:sts::123456789012:user/moto",
-    "AKIAIOSFODNN7EXAMPLE",
-    '"Users": []',
-    "<Users/>",
-    "<Users></Users>",
-    '"Roles": []',
-    "<Roles/>",
-    "<Roles></Roles>",
-    '"Groups": []',
-    "<Groups/>",
-    "<Groups></Groups>",
-    '"Policies": []',
-    "<Policies/>",
-    "<Policies></Policies>",
-    '"SecretList": []',
-    '"Parameters": []',
-    '"InstanceInformationList": []',
-    '"Buckets": []',
-    "<Buckets/>",
-    "<Buckets></Buckets>",
-    "NoSuchEntity",
-    "NoSuchBucket",
-    "ResourceNotFoundException",
-    "ParameterNotFound",
-    "TrailNotFoundException",
-    "Internal Server Error",
-)
-
-
 def _build_fallback_prompt(service: str, action: str, request_body: Any) -> str:
     # LLM에게 보낼 fallback 프롬프트를 만든다.
     return f"""You are an AWS API simulator. You must respond exactly like the real AWS CLI would.
@@ -727,9 +683,6 @@ class BaseResponse(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
                 response = http_error.description, response_headers  # type: ignore[assignment]
             except NotImplementedError as not_implemented_error:
                 # 핸들러는 찾았지만 내부 구현이 비어 있을 때 LLM fallback을 시도한다.
-                agent_response = self._turn_agent_fallback(action, headers)
-                if agent_response is not None:
-                    return agent_response
                 try:
                     _t0 = time.monotonic()
                     if os.getenv("MOTO_LLM_PROVIDER", "").lower() == "claude":
@@ -756,17 +709,10 @@ class BaseResponse(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
 
             headers, body = self._enrich_response(headers, body)
 
-            override = self._honeypot_early_override(action, status, headers, body)
-            if override is not None:
-                return override
-
             return status, headers, body
 
         if not action:
             # action 자체를 읽지 못한 요청에 대해 마지막 fallback을 시도한다.
-            agent_response = self._turn_agent_fallback("unknown", headers)
-            if agent_response is not None:
-                return agent_response
             try:
                 if os.getenv("MOTO_LLM_PROVIDER", "").lower() == "claude":
                     fallback_text = call_claude_api(_build_fallback_prompt(self.service_name, "unknown", self.body))
@@ -781,9 +727,6 @@ class BaseResponse(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
 
         try:
             # action은 알지만 핸들러 메서드가 없을 때 LLM fallback을 시도한다.
-            agent_response = self._turn_agent_fallback(action, headers)
-            if agent_response is not None:
-                return agent_response
             if os.getenv("MOTO_LLM_PROVIDER", "").lower() == "claude":
                 fallback_text = call_claude_api(_build_fallback_prompt(self.service_name, action, self.body))
             else:
@@ -795,94 +738,6 @@ class BaseResponse(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
             headers.update(fallback_headers)
             return 200, headers, fallback_body
         raise NotImplementedError(f"The {action} action has not been implemented")
-
-    def _turn_agent_fallback(self, action: str, headers: dict[str, Any]) -> TYPE_RESPONSE | None:
-        try:
-            from moto.core.llm_agents.metrics import log_metric
-            from moto.core.llm_agents.turn_agent import run as run_turn_agent
-
-            resp_headers, resp_body = run_turn_agent(
-                self.uri,
-                dict(self.headers),
-                self.body,
-                source=getattr(self, "access_key", "unknown"),
-                service=self.service_name,
-                action=self._get_action() or action or "unknown",
-                method=self.method,
-            )
-            merged_headers = dict(headers)
-            merged_headers.update(resp_headers)
-            log_metric(
-                "agent_fallback",
-                service=self.service_name,
-                action=self._get_action() or action or "unknown",
-                reason="native_handler_missing",
-            )
-            return 200, merged_headers, resp_body
-        except Exception as err:
-            log.warning("turn agent fallback failed for %s:%s - %s", self.service_name, action, err)
-            return None
-
-    def _honeypot_early_override(
-        self,
-        action: str,
-        status: int,
-        headers: dict[str, Any],
-        body: Any,
-    ) -> TYPE_RESPONSE | None:
-        """Replace weak native Moto inventory with the honeypot agent fast path.
-
-        Native Moto responses are valuable when they contain state, but an empty
-        freshly booted backend leaks the simulator. This hook only touches known
-        weak outputs and then lets turn_agent use state/template/cache before LLM.
-        """
-        if not _HONEYPOT_EARLY_OVERRIDE:
-            return None
-        if (self.service_name or "").lower() not in _HONEYPOT_EARLY_SERVICES:
-            return None
-        if not self._looks_like_weak_honeypot_response(status, body):
-            return None
-
-        try:
-            from moto.core.llm_agents.intercept import should_intercept_native
-            from moto.core.llm_agents.metrics import log_metric
-            from moto.core.llm_agents.turn_agent import run as run_turn_agent
-
-            if not should_intercept_native(self.service_name, action):
-                return None
-
-            llm_headers, llm_body = run_turn_agent(
-                self.uri,
-                dict(self.headers),
-                self.body,
-                source=getattr(self, "access_key", "unknown"),
-                service=self.service_name,
-                action=self._get_action(),
-                method=self.method,
-            )
-            merged_headers = dict(headers)
-            merged_headers.update(llm_headers)
-            log_metric(
-                "native_override",
-                service=self.service_name,
-                action=self._get_action(),
-                status=status,
-                reason="weak_native_response",
-                body_bytes=len(str(body).encode("utf-8", errors="ignore")),
-            )
-            return 200, merged_headers, llm_body
-        except Exception as err:
-            log.warning("honeypot early override failed for %s:%s - %s", self.service_name, action, err)
-            return None
-
-    @staticmethod
-    def _looks_like_weak_honeypot_response(status: int, body: Any) -> bool:
-        if status >= 500:
-            return True
-        text = body.decode("utf-8", errors="ignore") if isinstance(body, bytes) else str(body)
-        if status >= 400 and any(marker in text for marker in _HONEYPOT_WEAK_MARKERS):
-            return True
-        return any(marker in text for marker in _HONEYPOT_WEAK_MARKERS)
 
     @staticmethod
     def _transform_response(headers: dict[str, str], response: Any) -> TYPE_RESPONSE:  # type: ignore[misc]

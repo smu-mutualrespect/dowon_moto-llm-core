@@ -314,24 +314,7 @@ class DomainDispatcherApplication:
         return None, None
 
     def __call__(self, environ: dict[str, Any], start_response: Any) -> Any:
-        try:
-            backend_app = self.get_application(environ)
-        except Exception:
-            from werkzeug.wrappers import Request, Response
-
-            from moto.core.llm_agents import turn_agent
-
-            req = Request(environ)
-            source = req.headers.get("X-Forwarded-For") or req.remote_addr or "unknown"
-            resp_headers, resp_body = turn_agent.run(
-                url=req.url,
-                headers=dict(req.headers),
-                body=req.get_data(as_text=True),
-                source=source,
-                method=req.method,
-            )
-            response = Response(resp_body, status=200, headers=resp_headers)
-            return response(environ, start_response)
+        backend_app = self.get_application(environ)
         return backend_app(environ, start_response)
 
 

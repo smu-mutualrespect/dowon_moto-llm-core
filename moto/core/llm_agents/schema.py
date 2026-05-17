@@ -63,11 +63,6 @@ def get_service_schema(
             xmlns = ""
         output_schema = _shape_to_dict(op.output_shape)
         input_schema = _shape_to_dict(op.input_shape, max_depth=3)
-        xml_location_names = (
-            _extract_location_names(op.output_shape)
-            if protocol in ("ec2", "query", "rest-xml")
-            else {}
-        )
         required = list(getattr(op.input_shape, "required_members", []) or []) if op.input_shape else []
         return {
             "protocol": protocol,
@@ -75,7 +70,6 @@ def get_service_schema(
             "operation_name": op_name,
             "output_schema": output_schema,
             "input_schema": input_schema,
-            "xml_location_names": xml_location_names,
             "required_input": required,
             "schema_prompt": _compact_schema_prompt(output_schema),
             "xmlns": xmlns,
@@ -163,29 +157,6 @@ def _shape_to_dict(shape, depth: int = 0, max_depth: int = 4) -> Any:
         return type_name
     except Exception:
         return "..."
-
-
-def _extract_location_names(shape, depth: int = 0, max_depth: int = 6) -> Any:
-    if shape is None or depth > max_depth:
-        return {}
-    try:
-        serialization = getattr(shape, "serialization", {}) or {}
-        location_name = serialization.get("name")
-        type_name = shape.type_name
-        result: dict[str, Any] = {}
-        if location_name:
-            result["_name"] = location_name
-        if type_name == "structure":
-            for name, member in shape.members.items():
-                result[name] = _extract_location_names(member, depth + 1, max_depth)
-        elif type_name == "list":
-            result["_member"] = _extract_location_names(shape.member, depth + 1, max_depth)
-        elif type_name == "map":
-            result["_key"] = _extract_location_names(shape.key, depth + 1, max_depth)
-            result["_value"] = _extract_location_names(shape.value, depth + 1, max_depth)
-        return result
-    except Exception:
-        return {}
 
 
 def _compact_schema_prompt(schema: Any, max_chars: int = 1800) -> str:

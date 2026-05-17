@@ -5,9 +5,8 @@ import time
 from typing import Any
 
 from moto.core.llm_agents.agents import generate_agent
-from moto.core.llm_agents.generic_renderer import render_generic_response
 from moto.core.llm_agents.metrics import log_metric
-from moto.core.llm_agents.response_cache import get_cached_response, set_cached_response
+from moto.core.llm_agents.response_cache import get_cached_response
 from moto.core.llm_agents.state_renderer import render_state_response
 from moto.core.llm_agents.state import AgentState
 from moto.core.llm_agents.templates import render_template_response
@@ -45,19 +44,7 @@ def route_response(
             return templated, source
 
     draft = get_cached_response(state, schema)
-    if draft and validate_generated_response(draft, schema):
-        source = "cache"
-        _log_route(state, source, start)
-        return draft, source
-
-    generic = render_generic_response(state, schema)
-    if generic and validate_generated_response(generic, schema):
-        source = "generic"
-        set_cached_response(state, schema, generic)
-        _log_route(state, source, start)
-        return generic, source
-
-    source = "llm"
+    source = "draft" if draft else "llm"
 
     generated = generate_agent(
         state,
@@ -65,10 +52,10 @@ def route_response(
         request_valid=request_valid,
         validation_error=validation_error,
         error_body=error_body,
+        draft=draft or "",
     ).get("aws_response", "")
     generated = maybe_convert_to_xml(generated, schema)
     if generated and validate_generated_response(generated, schema):
-        set_cached_response(state, schema, generated)
         _log_route(state, source, start)
         return generated, source
 

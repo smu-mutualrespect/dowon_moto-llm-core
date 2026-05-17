@@ -90,7 +90,7 @@ def generate_agent(
     if not request_valid:
         return {"aws_response": error_body}
 
-    # no-output operation: avoid an unnecessary LLM call.
+    # Fix 1: no-output operation → LLM 호출 없이 직접 반환
     if schema is not None and schema.get("output_schema") == {}:
         return {"aws_response": _build_empty_response(schema)}
 

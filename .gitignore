@@ -24,7 +24,6 @@ tests/file.tmp
 .mypy_cache/
 *.tmp
 .venv/
-.env.honeypot
 htmlcov/
 .~c9_*
 .coverage*

@@ -41,41 +41,6 @@ def _cache_key(state: AgentState, schema: dict[str, Any] | None) -> str:
         "attacker_type": state["attacker_type"],
         "decoy_hit": state.get("decoy_hit", False),
         "decoys": decoys,
-        "request_scope": _request_scope(state),
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-def _request_scope(state: AgentState) -> dict[str, Any]:
-    """Keep cache hits broad for list APIs and precise for resource-specific APIs."""
-    action = str(state.get("action", "")).lower()
-    if action.startswith("list") and action not in {"listobjects", "listobjectsv2"}:
-        return {}
-    body = state.get("body", {})
-    if not isinstance(body, dict):
-        return {}
-    interesting = {
-        "arn",
-        "bucket",
-        "encodedmessage",
-        "layerdigest",
-        "layerdigests",
-        "name",
-        "policyarn",
-        "policysourcearn",
-        "repositoryname",
-        "resourcearn",
-        "resourcepolicy",
-        "secretid",
-        "uploadid",
-        "username",
-        "volumeid",
-        "volumeids",
-    }
-    scoped = {}
-    for key, value in body.items():
-        normalized = "".join(ch for ch in str(key).lower() if ch.isalnum())
-        if normalized in interesting:
-            scoped[str(key)] = value
-    return scoped

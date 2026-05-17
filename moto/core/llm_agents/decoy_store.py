@@ -43,8 +43,8 @@ def detect_decoy_hit(session_id: str, service: str, action: str, body: dict[str,
 def _flatten_values(body: Any) -> set[str]:
     result: set[str] = set()
     if isinstance(body, dict):
-        for value in body.values():
-            result |= _flatten_values(value)
+        for v in body.values():
+            result |= _flatten_values(v)
     elif isinstance(body, list):
         for item in body:
             result |= _flatten_values(item)
