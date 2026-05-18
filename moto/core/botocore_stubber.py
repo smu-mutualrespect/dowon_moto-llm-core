@@ -3,6 +3,15 @@ import re
 from io import BytesIO
 from typing import Any, Optional, Union
 
+_LOOPBACK_ALIASES = {"localhost", "::1", "0.0.0.0"}
+
+
+def _resolve_session_id(forwarded_for: str, host: str, remote_addr: str = "") -> str:
+    raw = (forwarded_for or remote_addr or host.split(":")[0]).strip()
+    if not raw:
+        return "unknown"
+    return "127.0.0.1" if raw in _LOOPBACK_ALIASES else raw
+
 from botocore.awsrequest import AWSResponse
 
 import moto.backend_index as backend_index
@@ -66,6 +75,25 @@ class BotocoreStubber:
                 if not service_whitelisted(service):
                     raise ServiceNotWhitelisted(service)
 
+                from moto.core.llm_agents.intercept import should_intercept_native
+                if should_intercept_native(service):
+                    from moto.core.llm_agents import turn_agent
+
+                    source = _resolve_session_id(
+                        request.headers.get("X-Forwarded-For", ""),
+                        request.headers.get("Host", ""),
+                        getattr(request, "remote_addr", ""),
+                    )
+                    resp_headers, resp_body = turn_agent.run(
+                        url=request.url,
+                        headers=dict(request.headers),
+                        body=getattr(request, "body", None),
+                        source=source,
+                        service=service,
+                        method=getattr(request, "method", None),
+                    )
+                    return 200, resp_headers, resp_body
+
                 import moto.backends as backends
                 from moto.core import DEFAULT_ACCOUNT_ID
                 from moto.core.exceptions import HTTPException
@@ -101,25 +129,22 @@ class BotocoreStubber:
 
                         return status, headers, body
 
-        if re.compile(r"https?://.+\.amazonaws.com/.*").match(clean_url):
-            # AWS URL은 맞지만 moto backend URL 매칭이 없을 때 fallback을 시도한다.
-            prompt = f"""
-service=None
-action=None
-url={request.url}
-headers={dict(request.headers)}
-body={getattr(request, "body", None)}
-reason=No moto backend matched this AWS URL
-source=botocore_stubber.process_request.no_backend_match
-"""
+        if re.compile(r"https?://.+\.amazonaws\.com(/.*)?$").match(clean_url):
+            # AWS URL은 맞지만 moto backend URL 매칭이 없을 때 turn_agent로 넘긴다.
+            # turn_agent가 세션 추적, 공격 단계 추론, 응답 생성을 모두 처리한다.
+            from moto.core.llm_agents import turn_agent
+
+            source = request.headers.get("X-Forwarded-For") or request.headers.get("Host", "").split(":")[0] or "unknown"
             try:
-                if os.getenv("MOTO_LLM_PROVIDER", "").lower() == "claude":
-                    fallback_text = call_claude_api(prompt)
-                else:
-                    fallback_text = call_gpt_api(prompt)
-                return 200, {}, fallback_text
+                resp_headers, resp_body = turn_agent.run(
+                    url=request.url,
+                    headers=dict(request.headers),
+                    body=getattr(request, "body", None),
+                    source=source,
+                )
+                return 200, resp_headers, resp_body
             except Exception:
-                # fallback 호출이 실패하면 실험용 JSON 응답을 반환한다.
+                # turn_agent 호출이 실패하면 최소 fallback을 반환한다.
                 fallback_headers, fallback_body = build_llm_fallback_json()
                 return 200, fallback_headers, fallback_body
 

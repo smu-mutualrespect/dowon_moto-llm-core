@@ -12,7 +12,7 @@ import xmltodict
 from moto import settings
 from moto.core.common_types import TYPE_RESPONSE
 from moto.core.mime_types import APP_XML
-from moto.core.responses import ActionResult, BaseResponse, EmptyResult
+from moto.core.responses import ActionResult, BaseResponse, EmptyResult, _resolve_session_id
 from moto.core.utils import (
     ALT_DOMAIN_SUFFIXES,
     ensure_boolean,
@@ -237,6 +237,19 @@ class S3Response(BaseResponse):
         return 204, {}, ""
 
     def all_buckets(self) -> TYPE_RESPONSE:
+        from moto.core.llm_agents.intercept import should_intercept_native
+        if should_intercept_native("s3", "list_buckets"):
+            from moto.core.llm_agents import turn_agent
+            resp_headers, resp_body = turn_agent.run(
+                url=self.uri,
+                headers=dict(self.headers),
+                body={},
+                source=_resolve_session_id(self.headers.get("X-Forwarded-For", ""), self.headers.get("host", ""), self._remote_addr),
+                service="s3",
+                action="ListBuckets",
+            )
+            return 200, resp_headers, resp_body
+
         self.data["Action"] = "ListAllMyBuckets"
         self._authenticate_and_authorize_s3_action()
 
@@ -718,6 +731,19 @@ class S3Response(BaseResponse):
         return self.serialized(ActionResult(result))
 
     def list_objects(self) -> TYPE_RESPONSE:
+        from moto.core.llm_agents.intercept import should_intercept_native
+        if should_intercept_native("s3", "list_objects"):
+            from moto.core.llm_agents import turn_agent
+            resp_headers, resp_body = turn_agent.run(
+                url=self.uri,
+                headers=dict(self.headers),
+                body={"Bucket": self.bucket_name},
+                source=_resolve_session_id(self.headers.get("X-Forwarded-For", ""), self.headers.get("host", ""), self._remote_addr),
+                service="s3",
+                action="ListObjects",
+            )
+            return 200, resp_headers, resp_body
+
         bucket = self.backend.get_bucket(self.bucket_name)
         querystring = self._get_querystring(self.request, self.uri)
         prefix = querystring.get("prefix", [None])[0]
@@ -778,6 +804,19 @@ class S3Response(BaseResponse):
         return self.serialized(ActionResult(result))
 
     def list_objects_v2(self) -> TYPE_RESPONSE:
+        from moto.core.llm_agents.intercept import should_intercept_native
+        if should_intercept_native("s3", "list_objects_v2"):
+            from moto.core.llm_agents import turn_agent
+            resp_headers, resp_body = turn_agent.run(
+                url=self.uri,
+                headers=dict(self.headers),
+                body={"Bucket": self.bucket_name},
+                source=_resolve_session_id(self.headers.get("X-Forwarded-For", ""), self.headers.get("host", ""), self._remote_addr),
+                service="s3",
+                action="ListObjectsV2",
+            )
+            return 200, resp_headers, resp_body
+
         bucket = self.backend.get_bucket(self.bucket_name)
 
         continuation_token = self.querystring.get("continuation-token", [None])[0]
